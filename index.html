@@ -407,31 +407,49 @@ function release(b) {
 }
 function pressButton(btn) {
   if (btn.press > 0) return; btn.press = 1.0;
-  if (btn.id === 'reset') { resetLab(); orbisScene = 'base'; orbisSteer(); }
+  if (btn.id === 'reset') { resetLab(); orbisScene = 'base'; orbisFresh(); }
   else if (btn.id === 'move') placeRequested = true;
   else if (btn.id === 'world') orbisToggle();
-  else if (btn.id === 'view') { orbisView = orbisView === 'look' ? 'micro' : 'look'; orbisSteer();
+  else if (btn.id === 'view') { orbisView = orbisView === 'look' ? 'micro' : 'look'; orbisScene = 'base'; orbisFresh();
     showBanner(orbisView === 'micro' ? 'Molecule view' : 'Real-world view', 'The living world re-imagines the scene in a few seconds', [0.75, 0.45, 0.98, 1]); }
 }
 
 // ---------------- Visko Orbis living world ----------------
-const ORBIS = {
-  base:       { look: 'a cozy chemistry laboratory at night, rows of glowing glass beakers on a wooden bench, soft volumetric light, cinematic, highly detailed',
-                micro: 'a calm sea of water molecules drifting in soft blue light, microscopic view, glowing spheres connected by bonds, cinematic' },
-  toothpaste: { look: 'a gigantic eruption of warm golden foam bursting out of a glass flask in a laboratory, steam rising, slow motion, cinematic',
-                micro: 'hydrogen peroxide molecules splitting apart on glowing iodide ions, oxygen bubbles bursting outward, molecular animation, cinematic' },
-  complex:    { look: 'a swirling vortex of deep royal blue liquid glowing inside a glass vessel, cinematic macro shot',
-                micro: 'copper ions each surrounded by four ammonia molecules forming glowing deep blue complexes, molecular animation, cinematic' },
-  fizz:       { look: 'millions of carbon dioxide bubbles rushing upward through fizzing liquid, macro photography, slow motion',
-                micro: 'baking soda and acetic acid molecules colliding and releasing carbon dioxide bubbles, glowing molecular animation' },
+// Prompts follow the Orbis prompt guide: a detailed opening shot (who/what/where + camera),
+// then short one-change "state transition" prompts that never restate the scene.
+const ORBIS_INIT = {
+  look: 'A chemistry teacher in a white lab coat and clear safety goggles stands behind a long black lab bench in a high school chemistry lab, arranging tall glass flasks of pale liquid. Shelves of brown reagent bottles line the back wall and warm overhead lights reflect off the glassware. Medium wide shot, eye-level, static camera, deep depth of field.',
+  micro: 'Clusters of molecules made of glossy red and white spheres joined by thin grey bonds drift slowly through clear blue liquid, seen up close under a microscope. Soft light shines down from above and a few tiny bubbles float between the molecules. Close-up, static camera, shallow depth of field.',
+};
+const ORBIS_STEP = {
+  look: { toothpaste: 'Thick golden-yellow foam surges up out of the tallest flask on the bench and spills down its sides onto the counter.',
+          complex: 'The liquid in the flask on the bench turns a deep royal blue and glows softly under the lights.',
+          fizz: 'The liquid in the flask on the bench fizzes with thousands of tiny rising bubbles that foam over the rim.' },
+  micro: { toothpaste: 'The red and white molecules split apart and a stream of small silver oxygen bubbles bursts outward between them.',
+           complex: 'Glowing copper spheres appear in the liquid and each gathers four small blue molecules around it, turning the scene deep blue.',
+           fizz: 'Thousands of clear carbon dioxide bubbles form between the molecules and rise rapidly upward.' },
 };
 let orbisScene = 'base', orbisView = 'look';
 const orbis = { status: 'off', reactor: null, video: null, audio: null, tex: gl.createTexture(), hasFrame: false, want: false, L: makeLabel(1024, 256) };
 function orbisLabel(line) { orbis.line = line; paintLabel(orbis.L, 'Living world · Visko Orbis', line, [0.25, 0.85, 0.45, 1]); }
 orbisLabel('Poke the green ball to open a live AI-generated world');
-function orbisPrompt() { return ORBIS[orbisScene][orbisView]; }
-function orbisSteer() {
-  if (orbis.reactor && orbis.status === 'ready') orbis.reactor.sendCommand('set_prompt', { prompt: orbisPrompt() });
+let orbisQueue = null, orbisLast = 0, orbisRunStart = 0;
+function orbisSteer() { orbisQueue = (ORBIS_STEP[orbisView] || {})[orbisScene] || null; }   // sent by orbisTick, spaced out
+async function orbisFresh() {   // clean new scene: avoids morphing between unrelated places and long-run drift
+  const r = orbis.reactor; orbisQueue = null; if (!r || orbis.status !== 'ready') return;
+  orbisLast = orbisRunStart = performance.now();
+  await r.sendCommand('reset', {});
+  await r.sendCommand('set_prompt', { prompt: ORBIS_INIT[orbisView] });
+  if (orbis.want) await r.sendCommand('start', {});
+}
+function orbisTick() {
+  if (!orbis.reactor || orbis.status !== 'ready' || !orbis.want) return;
+  const now = performance.now();
+  if (orbisQueue && now - orbisLast > 3000) {   // give each change ~3 s to land
+    orbis.reactor.sendCommand('set_prompt', { prompt: orbisQueue }); orbisQueue = null; orbisLast = now;
+  } else if (!orbisQueue && now - orbisRunStart > 150000 && now - orbisLast > 10000) {
+    orbisScene = 'base'; orbisFresh();   // quality drifts after a couple of minutes
+  }
 }
 async function loadReactor() {
   if (window.__REACTOR_MOCK) return window.__REACTOR_MOCK;
@@ -451,6 +469,8 @@ async function orbisStart() {
     if (!orbis.video) {
       orbis.video = Object.assign(document.createElement('video'), { muted: true, playsInline: true, autoplay: true });
       orbis.audio = Object.assign(document.createElement('audio'), { autoplay: true });
+      orbis.video.style.cssText = 'position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0.01;pointer-events:none';
+      document.body.append(orbis.video, orbis.audio);
     }
     const r = new Reactor({ modelName: 'reactor/visko-orbis-stable' }); orbis.reactor = r;
     r.on('trackReceived', (name, track, stream) => {
@@ -463,8 +483,9 @@ async function orbisStart() {
       if (st === 'ready' && orbis.want) {
         orbisLabel('Dreaming up the world…');
         await r.sendCommand('set_resolution', { resolution: '1080p' });   // default 2k is too heavy to upload per frame on Quest
-        await r.sendCommand('set_prompt', { prompt: orbisPrompt() });
+        await r.sendCommand('set_prompt', { prompt: ORBIS_INIT[orbisView] });
         await r.sendCommand('start', {});
+        orbisLast = orbisRunStart = performance.now(); orbisSteer();
       } else if (st === 'disconnected') { orbis.hasFrame = false; orbisLabel('Disconnected · poke the green ball to reconnect'); }
     });
     r.on('message', m => {   // keep the world running when a generation run ends
@@ -485,16 +506,22 @@ function orbisToggle() {
   if (orbis.audio) orbis.audio.muted = !orbis.want;
   showBanner(orbis.want ? 'Living world resumed' : 'Living world paused', 'Poke the green ball to toggle', [0.25, 0.85, 0.45, 1]);
 }
-function orbisFrame() {   // copy the latest video frame into a texture, once per rendered frame
+const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+function orbisFrame() {   // copy only NEW video frames into a mipmapped texture (no shimmer, less GPU work)
+  orbisTick();
   const v = orbis.video;
   if (!v || v.readyState < 2 || !v.videoWidth) return;
+  if (orbis.hasFrame && v.currentTime === orbis.lastTime) return;
+  orbis.lastTime = v.currentTime;
   gl.bindTexture(gl.TEXTURE_2D, orbis.tex);
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  if (aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
   orbis.hasFrame = true;
 }
 function interact(dt) {

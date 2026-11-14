@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Immersive Chem Lab (WebXR)</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0e13;color:#e6edf3;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden}
+  canvas{display:block;width:100%;height:100%;touch-action:none}
+  #hud{position:fixed;left:16px;top:16px;max-width:380px;background:rgba(13,17,23,.82);border:1px solid #30363d;border-radius:12px;padding:14px 16px;line-height:1.4}
+  #hud h1{font-size:18px;margin:0 0 6px}
+  #hud p{margin:6px 0;font-size:13px;color:#9da7b3}
+  #enter{margin-top:8px;font:600 15px system-ui,sans-serif;padding:10px 16px;border-radius:10px;border:0;background:#2f81f7;color:#fff;cursor:pointer}
+  #enter:disabled{background:#30363d;color:#8b949e;cursor:default}
+  #status{font-size:12px;color:#8b949e;margin-top:6px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <h1>Immersive Chem Lab</h1>
+  <p><b>Quest:</b> tap <b>Enter Lab</b>. Pinch a beaker, lift it over its partner and it pours. Poke the red ball to reset, the blue ball to move the lab in front of you.</p>
+  <p><b>Desktop preview:</b> drag a beaker over another one to pour.</p>
+  <p>Reacting pairs share a column: H₂O₂ + KI, CuSO₄ + NH₃, NaHCO₃ + vinegar.</p>
+  <button id="enter" disabled>Checking for WebXR…</button>
+  <div id="status"></div>
+</div>
+<script>
+'use strict';
+// MIT License. Immersive Chem Lab demo: raw WebGL2 + WebXR, no external dependencies.
+const $ = id => document.getElementById(id);
+const canvas = $('c');
+const gl = canvas.getContext('webgl2', { xrCompatible: true, alpha: true, antialias: true, premultipliedAlpha: true });
+if (!gl) { $('status').textContent = 'WebGL2 is not available in this browser.'; throw new Error('no webgl2'); }
+
+// ---------------- vector + matrix helpers ----------------
+const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const scl = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const len = a => Math.hypot(a[0], a[1], a[2]);
+const norm = a => { const l = len(a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+const dist3 = (a, b) => Math.hypot(a[0]-b[0], a[1]-b[1], a[2]-b[2]);
+const hdist = (a, b) => Math.hypot(a[0]-b[0], a[2]-b[2]);
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+const M4 = {
+  ident() { const m = new Float32Array(16); m[0] = m[5] = m[10] = m[15] = 1; return m; },
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      let s = 0; for (let k = 0; k < 4; k++) s += a[k*4 + r] * b[c*4 + k]; o[c*4 + r] = s;
+    }
+    return o;
+  },
+  persp(fovy, asp, n, f) {
+    const t = 1 / Math.tan(fovy / 2), m = new Float32Array(16);
+    m[0] = t / asp; m[5] = t; m[10] = (f + n) / (n - f); m[11] = -1; m[14] = 2 * f * n / (n - f); return m;
+  },
+  lookAt(e, c, u) {
+    const z = norm(sub(e, c)), x = norm(cross(u, z)), y = cross(z, x), m = new Float32Array(16);
+    m[0] = x[0]; m[1] = y[0]; m[2] = z[0];
+    m[4] = x[1]; m[5] = y[1]; m[6] = z[1];
+    m[8] = x[2]; m[9] = y[2]; m[10] = z[2];
+    m[12] = -(x[0]*e[0] + x[1]*e[1] + x[2]*e[2]);
+    m[13] = -(y[0]*e[0] + y[1]*e[1] + y[2]*e[2]);
+    m[14] = -(z[0]*e[0] + z[1]*e[1] + z[2]*e[2]);
+    m[15] = 1; return m;
+  },
+  // T(tx,ty,tz) * Ry(ry) * Rz(rz) * S(sx,sy,sz), column-major
+  trs(tx, ty, tz, ry, rz, sx, sy, sz) {
+    const cy = Math.cos(ry), sY = Math.sin(ry), cz = Math.cos(rz), sZ = Math.sin(rz), m = new Float32Array(16);
+    m[0] = cy*cz*sx;  m[1] = sZ*sx;  m[2] = -sY*cz*sx;
+    m[4] = -cy*sZ*sy; m[5] = cz*sy;  m[6] = sY*sZ*sy;
+    m[8] = sY*sz;     m[9] = 0;      m[10] = cy*sz;
+    m[12] = tx; m[13] = ty; m[14] = tz; m[15] = 1; return m;
+  },
+};
+
+// ---------------- shaders ----------------
+const VS = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec2 aUV;
+uniform mat4 uP, uV, uLab, uM;
+out vec3 vN; out vec3 vVN; out vec2 vUV;
+void main(){
+  mat4 lm = uLab * uM;
+  vN = mat3(uM) * aNrm;
+  vVN = mat3(uV * lm) * aNrm;
+  vUV = aUV;
+  gl_Position = uP * uV * lm * vec4(aPos, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec3 vN; in vec3 vVN; in vec2 vUV;
+uniform vec4 uColor; uniform float uRim; uniform float uEmit; uniform int uMode; uniform sampler2D uTex;
+out vec4 o;
+void main(){
+  if (uMode == 1) { o = texture(uTex, vUV) * uColor.a; return; }
+  vec3 n = normalize(vN); if (!gl_FrontFacing) n = -n;
+  float d = max(dot(n, normalize(vec3(0.35, 1.0, 0.45))), 0.0);
+  float rim = pow(1.0 - abs(normalize(vVN).z), 2.0);
+  vec3 c = uColor.rgb * (0.5 + 0.5 * d) + uColor.rgb * uEmit + vec3(rim * uRim);
+  float a = clamp(uColor.a + rim * uRim * 0.6, 0.0, 1.0);
+  o = vec4(c * a, a);
+}`;
+const PVS = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm;
+layout(location=3) in vec4 iPS; layout(location=4) in vec4 iCol;
+uniform mat4 uP, uV, uLab;
+out vec3 vN; out vec3 vVN; out vec4 vC;
+void main(){
+  vN = aNrm; vC = iCol; vVN = mat3(uV * uLab) * aNrm;
+  gl_Position = uP * uV * uLab * vec4(iPS.xyz + aPos * iPS.w, 1.0);
+}`;
+const PFS = `#version 300 es
+precision highp float;
+in vec3 vN; in vec3 vVN; in vec4 vC; out vec4 o;
+void main(){
+  float d = max(dot(normalize(vN), normalize(vec3(0.35, 1.0, 0.45))), 0.0);
+  float rim = pow(1.0 - abs(normalize(vVN).z), 2.0);
+  vec3 c = vC.rgb * (0.65 + 0.35 * d) + vec3(rim * 0.25);
+  float a = vC.a; o = vec4(c * a, a);
+}`;
+function program(vs, fs) {
+  const mk = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  const p = gl.createProgram(); gl.attachShader(p, mk(gl.VERTEX_SHADER, vs)); gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); u[info.name] = gl.getUniformLocation(p, info.name); }
+  return { p, u };
+}
+const prog = program(VS, FS), pprog = program(PVS, PFS);
+
+// ---------------- geometry ----------------
+function cylinderGeo(seg, top, bottom) {
+  const P = [], N = [], U = [], I = [];
+  for (let i = 0; i <= seg; i++) {
+    const a = i / seg * Math.PI * 2, c = Math.cos(a), s = Math.sin(a);
+    P.push(c, 0, s, c, 1, s); N.push(c, 0, s, c, 0, s); U.push(i / seg, 1, i / seg, 0);
+  }
+  for (let i = 0; i < seg; i++) { const a = i*2, b = a+1, c = a+2, d = a+3; I.push(a, b, c, b, d, c); }
+  const cap = (y, ny) => {
+    const base = P.length / 3; P.push(0, y, 0); N.push(0, ny, 0); U.push(0.5, 0.5);
+    for (let i = 0; i <= seg; i++) { const a = i / seg * Math.PI * 2; P.push(Math.cos(a), y, Math.sin(a)); N.push(0, ny, 0); U.push(0, 0); }
+    for (let i = 0; i < seg; i++) {
+      if (ny > 0) I.push(base, base + 2 + i, base + 1 + i); else I.push(base, base + 1 + i, base + 2 + i);
+    }
+  };
+  if (top) cap(1, 1); if (bottom) cap(0, -1);
+  return { P, N, U, I };
+}
+function sphereGeo(lat, lon) {
+  const P = [], N = [], U = [], I = [];
+  for (let j = 0; j <= lat; j++) {
+    const t = j / lat * Math.PI, st = Math.sin(t), ct = Math.cos(t);
+    for (let i = 0; i <= lon; i++) {
+      const f = i / lon * Math.PI * 2, x = st * Math.cos(f), z = st * Math.sin(f);
+      P.push(x, ct, z); N.push(x, ct, z); U.push(i / lon, j / lat);
+    }
+  }
+  for (let j = 0; j < lat; j++) for (let i = 0; i < lon; i++) {
+    const a = j * (lon + 1) + i, b = a + lon + 1, c = a + 1, d = b + 1; I.push(a, c, b, c, d, b);
+  }
+  return { P, N, U, I };
+}
+function boxGeo() {
+  const P = [], N = [], U = [], I = [];
+  const faces = [
+    [[1,0,0],[0,0,-1],[0,1,0]], [[-1,0,0],[0,0,1],[0,1,0]], [[0,1,0],[1,0,0],[0,0,-1]],
+    [[0,-1,0],[1,0,0],[0,0,1]], [[0,0,1],[1,0,0],[0,1,0]], [[0,0,-1],[-1,0,0],[0,1,0]],
+  ];
+  for (const [n, u, v] of faces) {
+    const base = P.length / 3;
+    for (const [su, sv] of [[-1,-1],[1,-1],[1,1],[-1,1]]) {
+      P.push(n[0]*.5 + u[0]*su*.5 + v[0]*sv*.5, n[1]*.5 + u[1]*su*.5 + v[1]*sv*.5, n[2]*.5 + u[2]*su*.5 + v[2]*sv*.5);
+      N.push(...n); U.push((su + 1) / 2, (1 - sv) / 2);
+    }
+    I.push(base, base+1, base+2, base, base+2, base+3);
+  }
+  return { P, N, U, I };
+}
+function quadGeo() {
+  return { P: [-.5,-.5,0, .5,-.5,0, .5,.5,0, -.5,.5,0], N: [0,0,1, 0,0,1, 0,0,1, 0,0,1], U: [0,1, 1,1, 1,0, 0,0], I: [0,1,2, 0,2,3] };
+}
+function mesh(g) {
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buf = (data, loc, n) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); return b; };
+  const pb = buf(g.P, 0, 3), nb = buf(g.N, 1, 3); buf(g.U, 2, 2);
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(g.I), gl.STATIC_DRAW);
+  gl.bindVertexArray(null); return { vao, count: g.I.length, pb, nb, ib };
+}
+const cylOpen = mesh(cylinderGeo(32, false, true));
+const cylClosed = mesh(cylinderGeo(32, true, true));
+const sphereM = mesh(sphereGeo(12, 16));
+const boxM = mesh(boxGeo());
+const quadM = mesh(quadGeo());
+
+// instanced low-poly spheres for particles
+const MAXP = 1500;
+const lowSphere = mesh(sphereGeo(5, 8));
+const inst = new Float32Array(MAXP * 8);
+const instBuf = gl.createBuffer();
+const pvao = gl.createVertexArray();
+gl.bindVertexArray(pvao);
+gl.bindBuffer(gl.ARRAY_BUFFER, lowSphere.pb); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ARRAY_BUFFER, lowSphere.nb); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ARRAY_BUFFER, instBuf); gl.bufferData(gl.ARRAY_BUFFER, inst.byteLength, gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(3, 1);
+gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(4, 1);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lowSphere.ib);
+gl.bindVertexArray(null);
+
+// ---------------- text labels (canvas textures) ----------------
+const css = c => `rgb(${Math.round(c[0]*255)},${Math.round(c[1]*255)},${Math.round(c[2]*255)})`;
+function makeLabel(w, h) {
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const tex = gl.createTexture();
+  return { cv, ctx: cv.getContext('2d'), tex, aspect: w / h };
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+}
+function fitFont(ctx, text, weight, size, maxW) {
+  let s = size; do { ctx.font = `${weight} ${s}px system-ui,"Segoe UI",Roboto,sans-serif`; s -= 2; } while (ctx.measureText(text).width > maxW && s > 8);
+}
+function paintLabel(L, title, subtitle, accent) {
+  const { ctx, cv } = L, W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(12,16,24,0.84)'; roundRect(ctx, 3, 3, W - 6, H - 6, H * 0.2); ctx.fill();
+  ctx.fillStyle = css(accent); roundRect(ctx, 3, 3, Math.max(10, W * 0.022), H - 6, Math.max(5, W * 0.011)); ctx.fill();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#ffffff';
+  if (subtitle) {
+    fitFont(ctx, title, 700, Math.round(H * 0.36), W * 0.9); ctx.fillText(title, W / 2, H * 0.37);
+    ctx.fillStyle = '#b9c5d6'; fitFont(ctx, subtitle, 500, Math.round(H * 0.22), W * 0.92); ctx.fillText(subtitle, W / 2, H * 0.73);
+  } else {
+    fitFont(ctx, title, 700, Math.round(H * 0.46), W * 0.88); ctx.fillText(title, W / 2, H * 0.53);
+  }
+  gl.bindTexture(gl.TEXTURE_2D, L.tex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+// ---------------- chemistry ----------------
+const REAGENTS = {
+  H2O2:   { name: 'H₂O₂',    full: 'Hydrogen peroxide', color: [0.78, 0.90, 1.00, 0.45] },
+  KI:     { name: 'KI',      full: 'Potassium iodide',  color: [1.00, 0.95, 0.70, 0.55] },
+  CuSO4:  { name: 'CuSO₄',   full: 'Copper(II) sulfate', color: [0.20, 0.58, 1.00, 0.85] },
+  NH3:    { name: 'NH₃',     full: 'Ammonia (aq)',      color: [0.85, 0.96, 0.90, 0.45] },
+  NaHCO3: { name: 'NaHCO₃',  full: 'Baking soda (aq)',  color: [0.96, 0.96, 0.96, 0.70] },
+  AcOH:   { name: 'CH₃COOH', full: 'Vinegar',           color: [1.00, 0.90, 0.62, 0.55] },
+};
+const REACTIONS = [
+  { id: 'toothpaste', needs: ['H2O2', 'KI'], title: 'Elephant toothpaste!',
+    eq: '2 H₂O₂ → 2 H₂O + O₂↑   (KI catalyst · exothermic)', color: [0.93, 0.55, 0.15, 0.92], fx: 'foam' },
+  { id: 'complex', needs: ['CuSO4', 'NH3'], title: 'Deep-blue copper complex',
+    eq: 'Cu²⁺ + 4 NH₃ → [Cu(NH₃)₄]²⁺', color: [0.08, 0.18, 0.95, 0.95], fx: 'sparkle' },
+  { id: 'fizz', needs: ['NaHCO3', 'AcOH'], title: 'CO₂ fizz!',
+    eq: 'NaHCO₃ + CH₃COOH → CO₂↑ + H₂O + CH₃COONa', color: [0.97, 0.95, 0.88, 0.72], fx: 'fizz' },
+];
+
+// ---------------- lab layout (meters, lab-local frame: tray top at y=0, user on +z side) ----------------
+const BR = 0.032, BH = 0.095, IR = 0.0285, LMAX = 0.086, TRAY_W = 0.64, TRAY_D = 0.32, HOLD_Y = 0.15, POUR_A = 1.15, START_VOL = 0.45;
+const LAYOUT = [['H2O2', -0.18, -0.06], ['CuSO4', 0, -0.06], ['NaHCO3', 0.18, -0.06],
+                ['KI', -0.18, 0.07], ['NH3', 0, 0.07], ['AcOH', 0.18, 0.07]];
+const beakers = LAYOUT.map(([r, x, z], i) => {
+  const b = { i, reagent: r, home: [x, 0, z], back: z < 0, label: makeLabel(512, 160) };
+  paintLabel(b.label, REAGENTS[r].name, REAGENTS[r].full, REAGENTS[r].color);
+  return b;
+});
+const buttons = [
+  { id: 'reset', pos: [0.27, 0.02, 0.12], r: 0.017, color: [0.92, 0.28, 0.28, 1], text: 'Reset', press: 0, xrOnly: false },
+  { id: 'move',  pos: [-0.27, 0.02, 0.12], r: 0.017, color: [0.25, 0.56, 0.98, 1], text: 'Move lab here', press: 0, xrOnly: true },
+];
+for (const btn of buttons) { btn.label = makeLabel(512, 128); paintLabel(btn.label, btn.text, null, btn.color); }
+const titleL = makeLabel(1024, 256);
+paintLabel(titleL, 'Immersive Chem Lab', 'Pinch a beaker · lift it over its partner to pour', [0.3, 0.75, 1]);
+const banner = { L: makeLabel(1024, 200), t: 0 };
+function showBanner(title, line, color) { paintLabel(banner.L, title, line, color); banner.t = 7; }
+
+let parts = [];
+function vol(b) { let t = 0; for (const k in b.contents) t += b.contents[k]; return t; }
+function liquidH(b) { return Math.min(vol(b), 1) * LMAX; }
+function liquidColor(b) {
+  let r = 0, g = 0, bl = 0, a = 0, t = 0;
+  for (const k in b.contents) { const w = b.contents[k]; if (w <= 0) continue; const c = REAGENTS[k].color;
+    r += c[0]*w; g += c[1]*w; bl += c[2]*w; a += c[3]*w; t += w; }
+  if (t <= 0) return null;
+  let col = [r/t, g/t, bl/t, a/t];
+  if (b.product) col = col.map((v, i) => v + (b.product[i] - v) * b.productMix);
+  return col;
+}
+function resetLab(quiet) {
+  parts = [];
+  for (const b of beakers) Object.assign(b, {
+    contents: { [b.reagent]: START_VOL }, pos: b.home.slice(), target: b.home.slice(), tilt: 0, tiltTarget: 0, tiltDir: 1,
+    heldBy: null, offset: [0, 0, 0], pouringInto: null, done: {}, product: null, productMix: 0, effects: [], hover: false,
+  });
+  for (const p of ptrs.values()) p.held = null;
+  if (!quiet) showBanner('Lab reset', 'Pick up a beaker and pour it into its partner', [0.4, 0.7, 1, 1]);
+}
+function checkReactions(B) {
+  for (const r of REACTIONS) {
+    if (B.done[r.id]) continue;
+    if (r.needs.every(k => (B.contents[k] || 0) >= 0.06)) {
+      B.done[r.id] = true; B.product = r.color; B.productMix = 0;
+      B.effects.push({ kind: r.fx, t: 0, acc: 0, acc2: 0 });
+      showBanner(r.title, r.eq, r.color);
+    }
+  }
+  const keys = Object.keys(B.contents).filter(k => B.contents[k] >= 0.06).sort();
+  if (keys.length >= 2 && !REACTIONS.some(r => r.needs.every(k => keys.includes(k)))) {
+    const sig = 'mix:' + keys.join('+');
+    if (!B.done[sig]) { B.done[sig] = true;
+      showBanner('No visible reaction', keys.map(k => REAGENTS[k].name).join(' + ') + ' · try the partner in the same column', [0.6, 0.65, 0.72, 1]); }
+  }
+}
+
+// ---------------- particles ----------------
+function emit(q) { if (parts.length < MAXP) { q.age = 0; q.seed = Math.random() * 6.28; parts.push(q); } }
+function updateParticles(dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const q = parts[i]; q.age += dt; let dead = q.age >= q.life;
+    q.v[1] += (q.g || 0) * dt;
+    if (q.drag) { const k = Math.max(0, 1 - q.drag * dt); q.v[0] *= k; q.v[2] *= k; }
+    q.p[0] += q.v[0] * dt; q.p[1] += q.v[1] * dt; q.p[2] += q.v[2] * dt;
+    if (q.kind === 'drop' && q.p[1] < q.killY) dead = true;
+    if (q.kind === 'bubble' && q.p[1] > liquidH(q.b)) dead = true;
+    if (q.kind === 'foam') {
+      if (Math.abs(q.p[0]) < TRAY_W / 2 && Math.abs(q.p[2]) < TRAY_D / 2 && q.p[1] < 0.006 && q.v[1] < 0) { q.p[1] = 0.006; q.v = [0, 0, 0]; q.g = 0; }
+      if (q.p[1] < -1) dead = true;
+    }
+    if (dead) { parts[i] = parts[parts.length - 1]; parts.pop(); }
+  }
+}
+function updateEffects(dt) {
+  for (const b of beakers) {
+    if (b.product) b.productMix = Math.min(1, b.productMix + dt * 0.5);
+    for (const fx of b.effects) {
+      fx.t += dt; const lh = liquidH(b);
+      if (fx.kind === 'foam' && fx.t < 7) {
+        fx.acc += (fx.t < 4 ? 170 : 50) * dt;
+        while (fx.acc >= 1) { fx.acc--;
+          emit({ kind: 'foam', p: [b.pos[0] + rand(-.016, .016), b.pos[1] + lh + 0.004, b.pos[2] + rand(-.016, .016)],
+            v: [rand(-.025, .025), rand(.12, .30), rand(-.025, .025)], g: -0.14, drag: 1.5, life: rand(2.4, 4.0),
+            s0: 0.006, s1: 0.016, c: [0.99, rand(0.86, 0.95), rand(0.62, 0.75), 0.96] }); }
+      }
+      if (fx.kind === 'fizz' && fx.t < 6) {
+        fx.acc += 130 * dt;
+        while (fx.acc >= 1) { fx.acc--; const a = rand(0, 6.28), r = Math.sqrt(Math.random()) * IR * 0.85;
+          emit({ kind: 'bubble', b, p: [Math.cos(a) * r, rand(0.004, Math.max(0.005, lh * 0.9)), Math.sin(a) * r],
+            v: [0, rand(.07, .15), 0], life: 2, s0: 0.0032, s1: 0.0045, c: [1, 1, 1, 0.8] }); }
+        fx.acc2 += 28 * dt;
+        while (fx.acc2 >= 1) { fx.acc2--;
+          emit({ kind: 'foam', p: [b.pos[0] + rand(-.02, .02), b.pos[1] + lh + 0.004, b.pos[2] + rand(-.02, .02)],
+            v: [rand(-.015, .015), rand(.03, .09), rand(-.015, .015)], g: -0.05, drag: 2, life: rand(1.2, 2.4),
+            s0: 0.005, s1: 0.012, c: [1, 1, 0.97, 0.9] }); }
+      }
+      if (fx.kind === 'sparkle' && fx.t < 4) {
+        fx.acc += 45 * dt;
+        while (fx.acc >= 1) { fx.acc--; const a = rand(0, 6.28), r = Math.sqrt(Math.random()) * IR * 0.8;
+          emit({ kind: 'sparkle', b, p: [Math.cos(a) * r, rand(0.01, lh + 0.03), Math.sin(a) * r],
+            v: [rand(-.01, .01), rand(.03, .08), rand(-.01, .01)], life: rand(1, 1.8), s0: 0.0035, s1: 0.002, c: [0.65, 0.88, 1, 1] }); }
+      }
+    }
+    b.effects = b.effects.filter(fx => fx.t < 8);
+  }
+}
+
+// ---------------- interaction ----------------
+const ptrs = new Map();
+let placeRequested = false, xrSession = null, xrRef = null, xrMode = null, headLocal = [0, 0.4, 0.6];
+const lab = { origin: [0, 0, 0], yaw: 0, M: M4.ident() };
+function setLab(o, yaw) { lab.origin = o; lab.yaw = yaw; lab.M = M4.trs(o[0], o[1], o[2], yaw, 0, 1, 1, 1); }
+function toLocal(p) {
+  const dx = p.x - lab.origin[0], dy = p.y - lab.origin[1], dz = p.z - lab.origin[2], c = Math.cos(lab.yaw), s = Math.sin(lab.yaw);
+  return [dx*c - dz*s, dy, dx*s + dz*c];
+}
+function pourPose(A, B) {
+  const a = POUR_A, dir = A.tiltDir;
+  const rx = BR * Math.cos(a) + BH * Math.sin(a), ry = -BR * Math.sin(a) + BH * Math.cos(a);
+  return [B.pos[0] - dir * rx, B.pos[1] + BH + 0.035 - ry, B.pos[2]];
+}
+function release(b) {
+  b.heldBy = null; b.pouringInto = null; b.tiltTarget = 0;
+  const x = b.pos[0], z = b.pos[2];
+  const inside = Math.abs(x) < TRAY_W / 2 - 0.03 && Math.abs(z) < TRAY_D / 2 - 0.03;
+  const clash = beakers.some(o => o !== b && hdist([x, 0, z], o.target) < 0.07);
+  b.target = (inside && !clash) ? [x, 0, z] : b.home.slice();
+}
+function pressButton(btn) {
+  if (btn.press > 0) return; btn.press = 1.0;
+  if (btn.id === 'reset') resetLab(); else placeRequested = true;
+}
+function interact(dt) {
+  for (const b of beakers) b.hover = false;
+  for (const btn of buttons) btn.press = Math.max(0, btn.press - dt);
+  for (const p of ptrs.values()) {
+    const isMouse = p.kind === 'mouse';
+    const activeButtons = buttons.filter(btn => !btn.xrOnly || xrSession);
+    // poke buttons with the index fingertip
+    if (p.kind === 'hand') for (const btn of activeButtons) if (dist3(p.index, btn.pos) < btn.r + 0.012) pressButton(btn);
+    let consumed = false;
+    if (p.justDown) {
+      for (const btn of activeButtons) {
+        const d = isMouse ? hdist(p.pick, btn.pos) : dist3(p.pos, btn.pos);
+        if (d < btn.r + (isMouse ? 0.02 : 0.03)) { pressButton(btn); consumed = true; }
+      }
+    }
+    // find the nearest grabbable beaker
+    let best = null, bd = isMouse ? 0.05 : 0.08;
+    if (!p.held) for (const b of beakers) {
+      if (b.heldBy) continue;
+      const c = [b.pos[0], b.pos[1] + 0.05, b.pos[2]];
+      const d = isMouse ? hdist(p.pick, c) : dist3(p.pos, c);
+      if (d < bd) { bd = d; best = b; }
+    }
+    if (best) best.hover = true;
+    p.hovering = !!best;
+    if (p.justDown && !consumed && best) {
+      best.heldBy = p.id; p.held = best;
+      best.offset = isMouse ? [0, 0, 0] : sub(best.pos, p.pos);
+    }
+    if (p.held && p.down) {
+      const b = p.held, free = add(p.pos, b.offset);
+      if (b.pouringInto) {
+        if (dist3(free, pourPose(b, b.pouringInto)) > 0.15 || vol(b) < 0.005) b.pouringInto = null;
+      }
+      if (!b.pouringInto && vol(b) > 0.01) {
+        for (const B of beakers) {
+          if (B === b) continue;
+          if (hdist(free, B.pos) < 0.085 && free[1] > B.pos[1] + BH - 0.01) { b.pouringInto = B; b.tiltDir = free[0] <= B.pos[0] ? 1 : -1; break; }
+        }
+      }
+      if (b.pouringInto) {
+        const B = b.pouringInto; b.target = pourPose(b, B); b.tiltTarget = POUR_A;
+        if (b.tilt > POUR_A * 0.8) {
+          const tot = vol(b), amt = Math.min(tot, 0.25 * dt, Math.max(0, 1 - vol(B)));
+          if (amt > 0) {
+            for (const k in b.contents) { const share = b.contents[k] / tot * amt; b.contents[k] -= share; B.contents[k] = (B.contents[k] || 0) + share; }
+            checkReactions(B);
+            const col = liquidColor(b) || [0.8, 0.9, 1, 0.8];
+            for (let n = 0; n < 2; n++) emit({ kind: 'drop', p: [B.pos[0] + rand(-.003, .003), B.pos[1] + BH + 0.03, B.pos[2] + rand(-.003, .003)],
+              v: [0, -0.15, 0], g: -3, life: 1, killY: B.pos[1] + liquidH(B), s0: 0.0035, s1: 0.0035, c: [col[0], col[1], col[2], Math.max(0.6, col[3])] });
+          }
+        }
+      } else { b.target = free; b.tiltTarget = 0; }
+    }
+    if (p.held && p.justUp) { release(p.held); p.held = null; }
+  }
+}
+function updateBeakers(dt) {
+  for (const b of beakers) {
+    const k = Math.min(1, dt * (b.heldBy ? 20 : 9));
+    for (let j = 0; j < 3; j++) b.pos[j] += (b.target[j] - b.pos[j]) * k;
+    b.tilt += (b.tiltTarget - b.tilt) * Math.min(1, dt * 7);
+  }
+}
+function step(dt, raw) {
+  const seen = new Set();
+  for (const r of raw) {
+    seen.add(r.id);
+    let p = ptrs.get(r.id); if (!p) { p = { id: r.id, down: false, held: null }; ptrs.set(r.id, p); }
+    Object.assign(p, r);
+    const pressed = r.kind === 'hand' ? (p.down ? r.pinchDist < 0.045 : r.pinchDist < 0.025) : !!r.pressedRaw;
+    p.justDown = pressed && !p.down; p.justUp = !pressed && p.down; p.down = pressed;
+  }
+  for (const [id, p] of ptrs) if (!seen.has(id)) { if (p.held) release(p.held); ptrs.delete(id); }
+  interact(dt); updateBeakers(dt); updateEffects(dt); updateParticles(dt);
+  banner.t = Math.max(0, banner.t - dt);
+}
+
+// ---------------- rendering ----------------
+let U = prog.u;
+function drawM(m, M, col, rim = 0, emitv = 0) {
+  gl.uniformMatrix4fv(U.uM, false, M); gl.uniform4fv(U.uColor, col); gl.uniform1f(U.uRim, rim); gl.uniform1f(U.uEmit, emitv);
+  gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_SHORT, 0);
+}
+function drawLabel(L, pos, w, opacity) {
+  const yaw = Math.atan2(headLocal[0] - pos[0], headLocal[2] - pos[2]);
+  gl.bindTexture(gl.TEXTURE_2D, L.tex);
+  drawM(quadM, M4.trs(pos[0], pos[1], pos[2], yaw, 0, w, w / L.aspect, 1), [1, 1, 1, opacity]);
+}
+const beakerBase = b => M4.trs(b.pos[0], b.pos[1], b.pos[2], 0, -b.tilt * b.tiltDir, 1, 1, 1);
+function drawParticles(P, V) {
+  const n = Math.min(parts.length, MAXP); if (!n) return;
+  let o = 0;
+  for (let i = 0; i < n; i++) {
+    const q = parts[i]; let x = q.p[0], y = q.p[1], z = q.p[2];
+    if (q.b) { x += q.b.pos[0]; y += q.b.pos[1]; z += q.b.pos[2]; }
+    const t = q.age / q.life; let a = q.c[3] * Math.min(1, (q.life - q.age) / 0.4);
+    if (q.kind === 'sparkle') a *= 0.55 + 0.45 * Math.sin(q.age * 30 + q.seed);
+    inst[o] = x; inst[o+1] = y; inst[o+2] = z; inst[o+3] = q.s0 + (q.s1 - q.s0) * t;
+    inst[o+4] = q.c[0]; inst[o+5] = q.c[1]; inst[o+6] = q.c[2]; inst[o+7] = Math.max(0, a); o += 8;
+  }
+  gl.useProgram(pprog.p);
+  gl.uniformMatrix4fv(pprog.u.uP, false, P); gl.uniformMatrix4fv(pprog.u.uV, false, V); gl.uniformMatrix4fv(pprog.u.uLab, false, lab.M);
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst, 0, n * 8);
+  gl.bindVertexArray(pvao); gl.drawElementsInstanced(gl.TRIANGLES, lowSphere.count, gl.UNSIGNED_SHORT, 0, n);
+  gl.useProgram(prog.p);
+}
+function drawScene(P, V) {
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(true);
+  gl.useProgram(prog.p); U = prog.u;
+  gl.uniformMatrix4fv(U.uP, false, P); gl.uniformMatrix4fv(U.uV, false, V); gl.uniformMatrix4fv(U.uLab, false, lab.M);
+  gl.uniform1i(U.uMode, 0); gl.uniform1i(U.uTex, 0); gl.activeTexture(gl.TEXTURE0);
+  // tray + glowing edge
+  drawM(boxM, M4.trs(0, -0.011, 0, 0, 0, TRAY_W, 0.022, TRAY_D), [0.13, 0.15, 0.19, 0.97], 0.12);
+  drawM(boxM, M4.trs(0, -0.0005, TRAY_D / 2 - 0.004, 0, 0, TRAY_W - 0.01, 0.002, 0.004), [0.3, 0.75, 1, 1], 0, 0.6);
+  // shadows under held beakers + desktop cursor
+  for (const b of beakers) if (b.heldBy && Math.abs(b.pos[0]) < TRAY_W / 2 && Math.abs(b.pos[2]) < TRAY_D / 2)
+    drawM(cylClosed, M4.trs(b.pos[0], 0.0008, b.pos[2], 0, 0, BR * 1.1, 0.0005, BR * 1.1), [0, 0, 0, 0.35]);
+  const m = ptrs.get('mouse');
+  if (m && m.pick && !m.held && Math.abs(m.pick[0]) < TRAY_W / 2 && Math.abs(m.pick[2]) < TRAY_D / 2)
+    drawM(cylClosed, M4.trs(m.pick[0], 0.001, m.pick[2], 0, 0, 0.012, 0.0005, 0.012), m.hovering ? [1, 0.85, 0.3, 0.8] : [1, 1, 1, 0.45]);
+  // liquids
+  for (const b of beakers) {
+    const v = vol(b); if (v < 0.004) continue;
+    drawM(cylClosed, M4.mul(beakerBase(b), M4.trs(0, 0.003, 0, 0, 0, IR, Math.min(v, 1) * LMAX, IR)), liquidColor(b), 0.15, b.product ? 0.2 * b.productMix : 0);
+  }
+  // buttons
+  for (const btn of buttons) {
+    if (btn.xrOnly && !xrSession) continue;
+    const s = btn.r * (btn.press > 0.75 ? 0.8 : 1);
+    drawM(sphereM, M4.trs(btn.pos[0], btn.pos[1], btn.pos[2], 0, 0, s, s, s), btn.color, 0.35, 0.15);
+  }
+  // fingertips / controllers
+  for (const p of ptrs.values()) {
+    const col = p.down ? [0.3, 1, 0.5, 0.95] : p.hovering ? [1, 0.85, 0.3, 0.95] : [1, 1, 1, 0.8];
+    if (p.kind === 'hand') for (const t of [p.index, p.thumb]) drawM(sphereM, M4.trs(t[0], t[1], t[2], 0, 0, 0.006, 0.006, 0.006), col, 0.3);
+    if (p.kind === 'ctrl') drawM(sphereM, M4.trs(p.pos[0], p.pos[1], p.pos[2], 0, 0, 0.012, 0.012, 0.012), col, 0.3);
+  }
+  drawParticles(P, V);
+  // glass (transparent, no depth write)
+  gl.depthMask(false);
+  for (const b of beakers) {
+    const base = beakerBase(b);
+    drawM(cylOpen, M4.mul(base, M4.trs(0, 0, 0, 0, 0, BR, BH, BR)), [0.82, 0.9, 1.0, b.hover || b.heldBy ? 0.16 : 0.08], b.hover || b.heldBy ? 0.95 : 0.55);
+    drawM(cylOpen, M4.mul(base, M4.trs(0, BH - 0.004, 0, 0, 0, BR * 1.06, 0.004, BR * 1.06)), [0.9, 0.95, 1, 0.3], 0.4);
+  }
+  // labels
+  gl.uniform1i(U.uMode, 1);
+  for (const b of beakers) drawLabel(b.label, [b.pos[0], b.pos[1] + (b.back ? 0.165 : 0.135), b.pos[2]], 0.12, 1);
+  for (const btn of buttons) if (!btn.xrOnly || xrSession) drawLabel(btn.label, [btn.pos[0], btn.pos[1] + 0.035, btn.pos[2]], 0.08, 0.95);
+  drawLabel(titleL, [0, 0.33, -0.16], 0.44, 1);
+  if (banner.t > 0) drawLabel(banner.L, [0, 0.245, -0.16], 0.44, Math.min(1, banner.t, (7 - banner.t) * 5));
+  gl.uniform1i(U.uMode, 0);
+  gl.depthMask(true); gl.bindVertexArray(null);
+}
+
+// ---------------- desktop preview ----------------
+const cam = { eye: [0, 0.36, 0.62], target: [0, 0.10, -0.05], fov: 55 * Math.PI / 180 };
+const mouse = { active: false, down: false, pick: null, hold: null };
+function camMats() { const asp = canvas.width / canvas.height; return { P: M4.persp(cam.fov, asp, 0.01, 20), V: M4.lookAt(cam.eye, cam.target, [0, 1, 0]) }; }
+function rayAt(cx, cy) {
+  const r = canvas.getBoundingClientRect(), nx = ((cx - r.left) / r.width) * 2 - 1, ny = 1 - ((cy - r.top) / r.height) * 2;
+  const f = norm(sub(cam.target, cam.eye)), right = norm(cross(f, [0, 1, 0])), up = cross(right, f), t = Math.tan(cam.fov / 2);
+  return { o: cam.eye, d: norm(add(f, add(scl(right, nx * t * r.width / r.height), scl(up, ny * t)))) };
+}
+function hitY(ray, y) { if (Math.abs(ray.d[1]) < 1e-5) return null; const t = (y - ray.o[1]) / ray.d[1]; return t > 0 ? add(ray.o, scl(ray.d, t)) : null; }
+function onMove(e) { const ray = rayAt(e.clientX, e.clientY); const pk = hitY(ray, 0.05), hd = hitY(ray, HOLD_Y); if (pk && hd) { mouse.pick = pk; mouse.hold = hd; mouse.active = true; } }
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerdown', e => { onMove(e); mouse.down = true; try { canvas.setPointerCapture(e.pointerId); } catch (_) {} });
+canvas.addEventListener('pointerup', () => { mouse.down = false; });
+canvas.addEventListener('pointercancel', () => { mouse.down = false; });
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2), w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+let lastT = 0;
+function desktopFrame(t) {
+  if (xrSession) return;
+  requestAnimationFrame(desktopFrame);
+  resize(); const dt = Math.min(0.05, lastT ? (t - lastT) / 1000 : 0.016); lastT = t;
+  headLocal = cam.eye;
+  step(dt, mouse.active ? [{ id: 'mouse', kind: 'mouse', pos: mouse.hold, pick: mouse.pick, pressedRaw: mouse.down }] : []);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.05, 0.06, 0.08, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const { P, V } = camMats(); drawScene(P, V);
+}
+
+// ---------------- WebXR ----------------
+function placeLab(pose) {
+  const p = pose.transform.position, q = pose.transform.orientation;
+  let fx = -2 * (q.x * q.z + q.w * q.y), fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+  const l = Math.hypot(fx, fz); if (l < 1e-3) { fx = 0; fz = -1; } else { fx /= l; fz /= l; }
+  setLab([p.x + fx * 0.45, p.y - 0.48, p.z + fz * 0.45], Math.atan2(-fx, -fz));
+}
+let xrLast = 0;
+function onXRFrame(t, frame) {
+  const s = frame.session; s.requestAnimationFrame(onXRFrame);
+  const pose = frame.getViewerPose(xrRef); if (!pose) return;
+  const dt = Math.min(0.05, xrLast ? (t - xrLast) / 1000 : 0.014); xrLast = t;
+  if (placeRequested) { placeLab(pose); placeRequested = false; }
+  headLocal = toLocal(pose.transform.position);
+  const raw = [];
+  for (const src of s.inputSources) {
+    if (src.hand) {
+      const ij = src.hand.get('index-finger-tip'), tj = src.hand.get('thumb-tip');
+      const ip = ij && frame.getJointPose(ij, xrRef), tp = tj && frame.getJointPose(tj, xrRef);
+      if (ip && tp) { const a = toLocal(ip.transform.position), b = toLocal(tp.transform.position);
+        raw.push({ id: 'h-' + src.handedness, kind: 'hand', pos: scl(add(a, b), 0.5), index: a, thumb: b, pinchDist: dist3(a, b) }); }
+    } else if (src.gripSpace) {
+      const gp = frame.getPose(src.gripSpace, xrRef);
+      if (gp) { const bt = src.gamepad ? src.gamepad.buttons : [];
+        raw.push({ id: 'c-' + src.handedness, kind: 'ctrl', pos: toLocal(gp.transform.position), pressedRaw: !!((bt[0] && bt[0].pressed) || (bt[1] && bt[1].pressed)) }); }
+    }
+  }
+  step(dt, raw);
+  const layer = s.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  if (xrMode === 'immersive-ar') gl.clearColor(0, 0, 0, 0); else gl.clearColor(0.06, 0.07, 0.09, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  for (const v of pose.views) { const vp = layer.getViewport(v); gl.viewport(vp.x, vp.y, vp.width, vp.height); drawScene(v.projectionMatrix, v.transform.inverse.matrix); }
+}
+async function startXR() {
+  try {
+    const s = await navigator.xr.requestSession(xrMode, { optionalFeatures: ['local-floor', 'hand-tracking'] });
+    xrSession = s;
+    try { await gl.makeXRCompatible(); } catch (e) { /* context already created xrCompatible */ }
+    s.updateRenderState({ baseLayer: new XRWebGLLayer(s, gl, { antialias: true, alpha: true }) });
+    try { xrRef = await s.requestReferenceSpace('local-floor'); } catch (e) { xrRef = await s.requestReferenceSpace('local'); }
+    for (const p of ptrs.values()) if (p.held) release(p.held);
+    ptrs.clear(); placeRequested = true; xrLast = 0; $('hud').style.display = 'none';
+    showBanner('Welcome to the lab!', 'Try H₂O₂ → KI · CuSO₄ → NH₃ · NaHCO₃ → vinegar', [0.3, 0.75, 1, 1]);
+    s.addEventListener('end', () => {
+      xrSession = null; ptrs.clear(); setLab([0, 0, 0], 0); $('hud').style.display = '';
+      for (const b of beakers) if (b.heldBy) release(b);
+      lastT = 0; requestAnimationFrame(desktopFrame);
+    });
+    s.requestAnimationFrame(onXRFrame);
+  } catch (e) { xrSession = null; $('status').textContent = 'Could not start XR: ' + e.message; }
+}
+async function initXR() {
+  const btn = $('enter');
+  if (!navigator.xr) { btn.textContent = 'Desktop preview (open on Quest for MR)'; return; }
+  try {
+    if (await navigator.xr.isSessionSupported('immersive-ar')) xrMode = 'immersive-ar';
+    else if (await navigator.xr.isSessionSupported('immersive-vr')) xrMode = 'immersive-vr';
+  } catch (e) { /* unsupported */ }
+  if (!xrMode) { btn.textContent = 'Desktop preview (open on Quest for MR)'; return; }
+  btn.disabled = false; btn.textContent = xrMode === 'immersive-ar' ? 'Enter Lab (mixed reality)' : 'Enter Lab (VR)';
+  btn.onclick = startXR;
+}
+
+// test/debug hook
+window.__lab = {
+  beakers, buttons, ptrs, get parts() { return parts; }, reset: () => resetLab(true),
+  screenOf(p) {
+    const { P, V } = camMats(), m = M4.mul(P, V), x = p[0], y = p[1], z = p[2];
+    const cx = m[0]*x + m[4]*y + m[8]*z + m[12], cy = m[1]*x + m[5]*y + m[9]*z + m[13], cw = m[3]*x + m[7]*y + m[11]*z + m[15];
+    const r = canvas.getBoundingClientRect(); return [r.left + (cx / cw + 1) / 2 * r.width, r.top + (1 - cy / cw) / 2 * r.height];
+  },
+};
+resetLab(true);
+showBanner('Welcome to the lab!', 'Try H₂O₂ → KI · CuSO₄ → NH₃ · NaHCO₃ → vinegar', [0.3, 0.75, 1, 1]);
+initXR();
+requestAnimationFrame(desktopFrame);
+</script>
+</body>
+</html>

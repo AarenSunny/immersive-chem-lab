@@ -22,12 +22,15 @@
   <p><b>Quest:</b> tap <b>Enter Lab</b>. Pinch a beaker, lift it over its partner and it pours. Poke the red ball to reset, the blue ball to move the lab in front of you.</p>
   <p><b>Desktop preview:</b> drag a beaker over another one to pour.</p>
   <p>Reacting pairs share a column: H₂O₂ + KI, CuSO₄ + NH₃, NaHCO₃ + vinegar.</p>
+  <p><b>Green ball:</b> open the live AI "living world" (Visko Orbis), steered by your reactions. <b>Purple ball:</b> switch between real-world and molecule view.</p>
   <button id="enter" disabled>Checking for WebXR…</button>
   <div id="status"></div>
 </div>
 <script>
 'use strict';
 // MIT License. Immersive Chem Lab demo: raw WebGL2 + WebXR, no external dependencies.
+// URL of your token server (see worker.js). Can also be set with ?token=https://... in the page URL.
+const ORBIS_TOKEN_URL = new URLSearchParams(location.search).get('token') || 'https://chemlab-orbis.asnu.workers.dev';
 const $ = id => document.getElementById(id);
 const canvas = $('c');
 const gl = canvas.getContext('webgl2', { xrCompatible: true, alpha: true, antialias: true, premultipliedAlpha: true });
@@ -282,6 +285,8 @@ const beakers = LAYOUT.map(([r, x, z], i) => {
 const buttons = [
   { id: 'reset', pos: [0.27, 0.02, 0.12], r: 0.017, color: [0.92, 0.28, 0.28, 1], text: 'Reset', press: 0, xrOnly: false },
   { id: 'move',  pos: [-0.27, 0.02, 0.12], r: 0.017, color: [0.25, 0.56, 0.98, 1], text: 'Move lab here', press: 0, xrOnly: true },
+  { id: 'world', pos: [0.27, 0.02, -0.09], r: 0.017, color: [0.25, 0.85, 0.45, 1], text: 'Living world', press: 0, xrOnly: false },
+  { id: 'view',  pos: [-0.27, 0.02, -0.09], r: 0.017, color: [0.75, 0.45, 0.98, 1], text: 'Molecule view', press: 0, xrOnly: false },
 ];
 for (const btn of buttons) { btn.label = makeLabel(512, 128); paintLabel(btn.label, btn.text, null, btn.color); }
 const titleL = makeLabel(1024, 256);
@@ -317,6 +322,7 @@ function checkReactions(B) {
       B.done[r.id] = true; B.product = r.color; B.productMix = 0;
       B.effects.push({ kind: r.fx, t: 0, acc: 0, acc2: 0 });
       showBanner(r.title, r.eq, r.color);
+      orbisScene = r.id; orbisSteer();
     }
   }
   const keys = Object.keys(B.contents).filter(k => B.contents[k] >= 0.06).sort();
@@ -401,7 +407,95 @@ function release(b) {
 }
 function pressButton(btn) {
   if (btn.press > 0) return; btn.press = 1.0;
-  if (btn.id === 'reset') resetLab(); else placeRequested = true;
+  if (btn.id === 'reset') { resetLab(); orbisScene = 'base'; orbisSteer(); }
+  else if (btn.id === 'move') placeRequested = true;
+  else if (btn.id === 'world') orbisToggle();
+  else if (btn.id === 'view') { orbisView = orbisView === 'look' ? 'micro' : 'look'; orbisSteer();
+    showBanner(orbisView === 'micro' ? 'Molecule view' : 'Real-world view', 'The living world re-imagines the scene in a few seconds', [0.75, 0.45, 0.98, 1]); }
+}
+
+// ---------------- Visko Orbis living world ----------------
+const ORBIS = {
+  base:       { look: 'a cozy chemistry laboratory at night, rows of glowing glass beakers on a wooden bench, soft volumetric light, cinematic, highly detailed',
+                micro: 'a calm sea of water molecules drifting in soft blue light, microscopic view, glowing spheres connected by bonds, cinematic' },
+  toothpaste: { look: 'a gigantic eruption of warm golden foam bursting out of a glass flask in a laboratory, steam rising, slow motion, cinematic',
+                micro: 'hydrogen peroxide molecules splitting apart on glowing iodide ions, oxygen bubbles bursting outward, molecular animation, cinematic' },
+  complex:    { look: 'a swirling vortex of deep royal blue liquid glowing inside a glass vessel, cinematic macro shot',
+                micro: 'copper ions each surrounded by four ammonia molecules forming glowing deep blue complexes, molecular animation, cinematic' },
+  fizz:       { look: 'millions of carbon dioxide bubbles rushing upward through fizzing liquid, macro photography, slow motion',
+                micro: 'baking soda and acetic acid molecules colliding and releasing carbon dioxide bubbles, glowing molecular animation' },
+};
+let orbisScene = 'base', orbisView = 'look';
+const orbis = { status: 'off', reactor: null, video: null, audio: null, tex: gl.createTexture(), hasFrame: false, want: false, L: makeLabel(1024, 256) };
+function orbisLabel(line) { orbis.line = line; paintLabel(orbis.L, 'Living world · Visko Orbis', line, [0.25, 0.85, 0.45, 1]); }
+orbisLabel('Poke the green ball to open a live AI-generated world');
+function orbisPrompt() { return ORBIS[orbisScene][orbisView]; }
+function orbisSteer() {
+  if (orbis.reactor && orbis.status === 'ready') orbis.reactor.sendCommand('set_prompt', { prompt: orbisPrompt() });
+}
+async function loadReactor() {
+  if (window.__REACTOR_MOCK) return window.__REACTOR_MOCK;
+  const srcs = ['https://esm.sh/@reactor-team/js-sdk', 'https://cdn.jsdelivr.net/npm/@reactor-team/js-sdk/+esm', 'https://unpkg.com/@reactor-team/js-sdk?module'];
+  for (const s of srcs) { try { const m = await import(s); if (m.Reactor) return m.Reactor; } catch (e) { console.warn('SDK load failed from', s, e); } }
+  throw new Error('could not load the Reactor SDK');
+}
+async function orbisStart() {
+  orbis.status = 'connecting'; orbis.want = true; orbisLabel('Connecting to Orbis…');
+  try {
+    if (ORBIS_TOKEN_URL.includes('REPLACE-ME')) throw new Error('token server URL not set (see README)');
+    const Reactor = await loadReactor();
+    const res = await fetch(ORBIS_TOKEN_URL, { method: 'POST' });
+    if (!res.ok) throw new Error('token server returned ' + res.status);
+    const { jwt } = await res.json();
+    if (!jwt) throw new Error('token server sent no jwt');
+    if (!orbis.video) {
+      orbis.video = Object.assign(document.createElement('video'), { muted: true, playsInline: true, autoplay: true });
+      orbis.audio = Object.assign(document.createElement('audio'), { autoplay: true });
+    }
+    const r = new Reactor({ modelName: 'reactor/visko-orbis-stable' }); orbis.reactor = r;
+    r.on('trackReceived', (name, track, stream) => {
+      const s = stream || (track ? new MediaStream([track]) : null); if (!s) return;
+      if (name === 'main_video') { orbis.video.srcObject = s; orbis.video.play().catch(() => {}); }
+      if (name === 'main_audio') { orbis.audio.srcObject = s; orbis.audio.play().catch(() => {}); }
+    });
+    r.on('statusChanged', async st => {
+      orbis.status = st;
+      if (st === 'ready' && orbis.want) {
+        orbisLabel('Dreaming up the world…');
+        await r.sendCommand('set_resolution', { resolution: '1080p' });   // default 2k is too heavy to upload per frame on Quest
+        await r.sendCommand('set_prompt', { prompt: orbisPrompt() });
+        await r.sendCommand('start', {});
+      } else if (st === 'disconnected') { orbis.hasFrame = false; orbisLabel('Disconnected · poke the green ball to reconnect'); }
+    });
+    r.on('message', m => {   // keep the world running when a generation run ends
+      const s = typeof m === 'string' ? m : JSON.stringify(m || {});
+      if (s.includes('generation_complete') && orbis.want) r.sendCommand('start', {});
+    });
+    r.on('error', e => console.warn('Orbis error', e));
+    await r.connect(jwt);
+  } catch (e) {
+    orbis.status = 'error'; orbis.want = false; orbisLabel('Orbis error: ' + e.message); console.warn(e);
+  }
+}
+function orbisToggle() {
+  if (orbis.status === 'off' || orbis.status === 'error' || orbis.status === 'disconnected') return orbisStart();
+  if (!orbis.reactor || orbis.status !== 'ready') return;
+  orbis.want = !orbis.want;
+  orbis.reactor.sendCommand(orbis.want ? 'resume' : 'pause', {});
+  if (orbis.audio) orbis.audio.muted = !orbis.want;
+  showBanner(orbis.want ? 'Living world resumed' : 'Living world paused', 'Poke the green ball to toggle', [0.25, 0.85, 0.45, 1]);
+}
+function orbisFrame() {   // copy the latest video frame into a texture, once per rendered frame
+  const v = orbis.video;
+  if (!v || v.readyState < 2 || !v.videoWidth) return;
+  gl.bindTexture(gl.TEXTURE_2D, orbis.tex);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  orbis.hasFrame = true;
 }
 function interact(dt) {
   for (const b of beakers) b.hover = false;
@@ -555,13 +649,30 @@ function drawScene(P, V) {
   for (const b of beakers) drawLabel(b.label, [b.pos[0], b.pos[1] + (b.back ? 0.165 : 0.135), b.pos[2]], 0.12, 1);
   for (const btn of buttons) if (!btn.xrOnly || xrSession) drawLabel(btn.label, [btn.pos[0], btn.pos[1] + 0.035, btn.pos[2]], 0.08, 0.95);
   drawLabel(titleL, [0, 0.33, -0.16], 0.44, 1);
+  // Orbis living-world screen behind the lab (16:9)
+  {
+    const sx = 0, sy = 0.62, sz = -0.42, W = 0.74, H = W * 9 / 16;
+    const yaw = Math.atan2(headLocal[0] - sx, headLocal[2] - sz);
+    gl.uniform1i(U.uMode, 0); gl.depthMask(true);
+    drawM(boxM, M4.trs(sx, sy, sz, yaw, 0, W + 0.02, H + 0.02, 0.008), [0.05, 0.07, 0.1, 0.95], 0.2);
+    gl.uniform1i(U.uMode, 1);
+    const off = M4.mul(M4.trs(sx, sy, sz, yaw, 0, 1, 1, 1), M4.trs(0, 0, 0.0045, 0, 0, 1, 1, 1));
+    if (orbis.hasFrame && orbis.status === 'ready') {
+      gl.bindTexture(gl.TEXTURE_2D, orbis.tex);
+      drawM(quadM, M4.mul(off, M4.trs(0, 0, 0, 0, 0, W, H, 1)), [1, 1, 1, 1]);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, orbis.L.tex);
+      drawM(quadM, M4.mul(off, M4.trs(0, 0, 0, 0, 0, W * 0.9, W * 0.9 / orbis.L.aspect, 1)), [1, 1, 1, 1]);
+    }
+    gl.depthMask(false);
+  }
   if (banner.t > 0) drawLabel(banner.L, [0, 0.245, -0.16], 0.44, Math.min(1, banner.t, (7 - banner.t) * 5));
   gl.uniform1i(U.uMode, 0);
   gl.depthMask(true); gl.bindVertexArray(null);
 }
 
 // ---------------- desktop preview ----------------
-const cam = { eye: [0, 0.36, 0.62], target: [0, 0.10, -0.05], fov: 55 * Math.PI / 180 };
+const cam = { eye: [0, 0.52, 1.02], target: [0, 0.30, -0.15], fov: 55 * Math.PI / 180 };
 const mouse = { active: false, down: false, pick: null, hold: null };
 function camMats() { const asp = canvas.width / canvas.height; return { P: M4.persp(cam.fov, asp, 0.01, 20), V: M4.lookAt(cam.eye, cam.target, [0, 1, 0]) }; }
 function rayAt(cx, cy) {
@@ -586,6 +697,7 @@ function desktopFrame(t) {
   resize(); const dt = Math.min(0.05, lastT ? (t - lastT) / 1000 : 0.016); lastT = t;
   headLocal = cam.eye;
   step(dt, mouse.active ? [{ id: 'mouse', kind: 'mouse', pos: mouse.hold, pick: mouse.pick, pressedRaw: mouse.down }] : []);
+  orbisFrame();
   gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clearColor(0.05, 0.06, 0.08, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   const { P, V } = camMats(); drawScene(P, V);
@@ -619,6 +731,7 @@ function onXRFrame(t, frame) {
     }
   }
   step(dt, raw);
+  orbisFrame();
   const layer = s.renderState.baseLayer;
   gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
   if (xrMode === 'immersive-ar') gl.clearColor(0, 0, 0, 0); else gl.clearColor(0.06, 0.07, 0.09, 1);
@@ -637,6 +750,7 @@ async function startXR() {
     showBanner('Welcome to the lab!', 'Try H₂O₂ → KI · CuSO₄ → NH₃ · NaHCO₃ → vinegar', [0.3, 0.75, 1, 1]);
     s.addEventListener('end', () => {
       xrSession = null; ptrs.clear(); setLab([0, 0, 0], 0); $('hud').style.display = '';
+      if (orbis.want && orbis.reactor && orbis.status === 'ready') orbisToggle();   // pause to save credits
       for (const b of beakers) if (b.heldBy) release(b);
       lastT = 0; requestAnimationFrame(desktopFrame);
     });

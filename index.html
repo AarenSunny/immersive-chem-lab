@@ -1341,6 +1341,7 @@ function drawScene(P, V) {
   drawLabel(titleL, [0, 0.33 + ly, -0.16 - ly * 0.4], 0.44, 1);
   if (banner.t > 0) drawLabel(banner.L, [0, 0.245 + ly, -0.16 - ly * 0.4], 0.44, Math.min(1, banner.t, (7 - banner.t) * 5));
   if (panelOn) drawLabel(panelL, [-0.47, 0.17, -0.04], 0.2, 1);
+  if (typeof assistDraw === 'function') assistDraw();
   if (!(orbis.hasFrame && orbis.status === 'ready')) drawLabel(orbis.L, [0, 0.52 + ly, -0.35], 0.42, 0.95);
   gl.uniform1i(U.uMode, 0); gl.depthMask(true); gl.bindVertexArray(null);
 }
@@ -1481,5 +1482,209 @@ paintCards();
 enterSpace(linked ? 'custom' : null);
 initXR();
 requestAnimationFrame(desktopFrame);
+
+// ======================================================================
+// VOICE LAB ASSISTANT ("Nova"): poke the orange button, talk, hear the answer.
+// Mic -> 16 kHz WAV -> Worker /assist (Whisper + Llama with live lab state) -> /tts (Aura voice)
+// ======================================================================
+const ASSIST_URL = ORBIS_TOKEN_URL.replace(/\/+$/, '');
+const assist = {
+  state: 'idle',            // idle | listening | thinking | speaking | error
+  stream: null, ctx: null, proc: null, chunks: [], rate: 48000,
+  heardAt: 0, speechSeen: false, startedAt: 0,
+  history: [], events: [], audio: null,
+  L: makeLabel(512, 560), shown: 0,
+};
+
+// remember what happened so the assistant can talk about it
+const _showBanner = showBanner;
+showBanner = function (title, line, color) {   // eslint-disable-line no-global-assign
+  _showBanner(title, line, color);
+  assist.events.push(String(title) + (line ? ' (' + line + ')' : ''));
+  if (assist.events.length > 12) assist.events.shift();
+};
+
+function assistContext() {
+  const s = space, L = [];
+  if (!s) L.push('In the hub, choosing between Chem Lab, Circuit Lab, Factory Training and a teacher-made space.');
+  else {
+    L.push(`Current space: ${s.title} (${s.why}). Goal: ${s.hint || ''}`);
+    if (s.id === 'chem') {
+      L.push('Beakers on the bench (capacity 100%): ' + s.items.map(b => {
+        const parts = Object.entries(b.contents || {}).filter(([, v]) => v > 0.02).map(([k]) => REAGENTS[k].full);
+        const where = b.heldBy ? ', being held' : '';
+        return `${REAGENTS[b.reagent].full} beaker: ${Math.round(b.vol() * 100)}% full` + (parts.length > 1 ? ` (now a mix of ${parts.join(' + ')})` : '') + where;
+      }).join('; ') + '.');
+      L.push('Reactions possible: hydrogen peroxide + potassium iodide = elephant toothpaste; copper sulfate + ammonia = deep blue complex; baking soda + vinegar = CO2 fizz. Pour by tilting a held beaker over another.');
+      L.push(`Spilled puddles on bench: ${s.puddles ? s.puddles.length : 0}.`);
+    } else if (s.id === 'circuit') {
+      const placed = s.items.filter(it => it.slot >= 0).map(it => it.name);
+      L.push(`Breadboard loop state: ${s.state}. Current: ${Math.round((s.I || 0) * 1000)} mA. LED burnt out: ${!!s.ledBurnt}. Parts in the 3 sockets: ${placed.length ? placed.join(', ') : 'none'}.`);
+      L.push('Parts: 9 V battery, 330 ohm resistor, red LED (max about 20 mA), DC motor, jumper wires. An LED needs the resistor in series or it burns out; a wire alone across the battery is a short circuit.');
+    } else if (s.id === 'factory') {
+      L.push(`Lockout/tagout progress: E-stop pressed ${!!s.stopped}, main disconnect off ${!!s.off}, padlock on ${!!s.locked}, danger tag hung ${!!s.tagged}, zero energy verified ${!!s.verified}. Mistakes so far: ${s.mistakes || 0}. Press still running: ${!!s.running && !s.stopped}.`);
+      L.push('Correct order: 1 press red E-STOP, 2 switch main disconnect OFF, 3 put your padlock on the handle, 4 hang the danger tag, 5 press START to verify nothing moves.');
+    } else if (s.def) {
+      const st = s.def.steps || [];
+      L.push(`Teacher-made space. Why it matters: ${s.def.why}. Steps: ${st.map((x, i) => (i + 1) + ') ' + x.say).join(' ')} Current step: ${Math.min(s.step + 1, st.length)} of ${st.length}.`);
+    }
+  }
+  L.push(`Living AI world (Visko Orbis): ${orbis.status === 'ready' && orbis.want ? 'on' : 'off'}${space && orbisView === 'micro' ? ', zoomed-in view' : ''}.`);
+  if (assist.events.length) L.push('Recent events: ' + assist.events.slice(-6).join(' | '));
+  return L.join('\n');
+}
+
+function assistShow(who, text, color, heard) {
+  const lines = [];
+  if (heard) lines.push({ t: 'You asked:', c: '#8b949e', s: 0.85 }, { t: '“' + heard + '”', c: '#e6edf3' });
+  lines.push({ t: text, c: '#ffd9a8', b: !!heard });
+  paintPanel(assist.L, who, lines, color || [1, 0.6, 0.15, 1]);
+  assist.shown = 14;
+}
+
+async function assistPrime() {   // call from a real click so the browser can ask for the microphone
+  if (assist.stream) return true;
+  try {
+    assist.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    return true;
+  } catch (e) { console.warn('mic unavailable', e); return false; }
+}
+
+async function assistStart() {
+  if (assist.state === 'thinking') return;
+  if (assist.state === 'speaking' && assist.audio) { assist.audio.pause(); assistDone(); }
+  if (!(await assistPrime())) { assist.state = 'error'; assistShow('Microphone blocked', 'Allow the microphone for this site, or type a question on the desktop panel.', [1, 0.35, 0.3, 1]); return; }
+  assist.ctx = assist.ctx || new (window.AudioContext || window.webkitAudioContext)();
+  if (assist.ctx.state === 'suspended') await assist.ctx.resume();
+  assist.rate = assist.ctx.sampleRate; assist.chunks = [];
+  const src = assist.ctx.createMediaStreamSource(assist.stream);
+  const proc = assist.ctx.createScriptProcessor(4096, 1, 1);
+  src.connect(proc); proc.connect(assist.ctx.destination);
+  assist.src = src; assist.proc = proc;
+  assist.startedAt = assist.heardAt = performance.now(); assist.speechSeen = false;
+  proc.onaudioprocess = e => {
+    const d = e.inputBuffer.getChannelData(0); assist.chunks.push(new Float32Array(d));
+    let s = 0; for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+    const rms = Math.sqrt(s / d.length), now = performance.now();
+    if (rms > 0.02) { assist.speechSeen = true; assist.heardAt = now; }
+    // auto-send after ~1.3 s of silence once speech started, or after 12 s
+    if ((assist.speechSeen && now - assist.heardAt > 1300) || now - assist.startedAt > 12000) assistStop();
+    if (!assist.speechSeen && now - assist.startedAt > 7000) assistStop(true);
+  };
+  assist.state = 'listening';
+  if (orbis.audio) orbis.audio.volume = 0.15;
+  assistShow('Listening…', 'Ask Nova anything about this lab. Poke the orange button again to send.', [1, 0.3, 0.3, 1]);
+}
+
+function assistStop(cancel) {
+  if (assist.state !== 'listening') return;
+  try { assist.proc.disconnect(); assist.src.disconnect(); } catch (e) { /* already disconnected */ }
+  assist.proc.onaudioprocess = null;
+  if (cancel || !assist.speechSeen) { assistShow('Nova', "I didn't hear anything. Poke the orange button and ask again.", [0.6, 0.65, 0.72, 1]); assistDone(); return; }
+  const wav = encodeWav(assist.chunks, assist.rate, 16000);
+  assistAsk({ audio: b64FromBytes(wav) });
+}
+
+async function assistAsk(payload) {
+  assist.state = 'thinking';
+  assistShow('Thinking…', payload.text ? '“' + payload.text + '”' : 'Nova is listening back to your question', [1, 0.75, 0.2, 1]);
+  try {
+    const res = await fetch(ASSIST_URL + '/assist', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, context: assistContext(), history: assist.history }),
+    });
+    const j = await res.json();
+    if (!res.ok || j.error) throw new Error(j.error || ('HTTP ' + res.status));
+    if (j.heard) { assist.history.push({ role: 'user', content: j.heard }, { role: 'assistant', content: j.reply }); assist.history = assist.history.slice(-8); }
+    assistShow('Nova · AI lab assistant', j.reply, null, j.heard);
+    const ht = document.getElementById('assist-log'); if (ht) ht.textContent = (j.heard ? 'You: ' + j.heard + '\n' : '') + 'Nova: ' + j.reply;
+    await assistSpeak(j.reply);
+  } catch (e) {
+    console.warn('assistant', e);
+    assistShow('Nova is offline', String(e.message || e).slice(0, 140), [1, 0.35, 0.3, 1]);
+    assistDone();
+  }
+}
+
+async function assistSpeak(text) {
+  assist.state = 'speaking';
+  try {
+    const res = await fetch(ASSIST_URL + '/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    if (!res.ok) throw new Error('tts ' + res.status);
+    const url = URL.createObjectURL(await res.blob());
+    const a = assist.audio = new Audio(url);
+    a.onended = a.onerror = () => { URL.revokeObjectURL(url); assistDone(); };
+    await a.play();
+  } catch (e) {   // fall back to the browser's own voice
+    if ('speechSynthesis' in window) {
+      const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; u.onend = u.onerror = assistDone;
+      speechSynthesis.cancel(); speechSynthesis.speak(u);
+    } else assistDone();
+  }
+}
+
+function assistDone() { assist.state = 'idle'; if (orbis.audio) orbis.audio.volume = 1; }
+
+function assistToggle() {
+  if (assist.state === 'listening') assistStop(); else assistStart();
+}
+
+// ---- audio helpers ----
+function encodeWav(chunks, inRate, outRate) {
+  let n = 0; for (const c of chunks) n += c.length;
+  const all = new Float32Array(n); let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
+  const ratio = inRate / outRate, len = Math.floor(n / ratio), pcm = new Int16Array(len);
+  for (let i = 0; i < len; i++) {   // simple box-filter downsample
+    const a = Math.floor(i * ratio), b = Math.min(n, Math.floor((i + 1) * ratio)); let s = 0;
+    for (let j = a; j < b; j++) s += all[j];
+    const v = Math.max(-1, Math.min(1, s / Math.max(1, b - a))); pcm[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+  }
+  const buf = new ArrayBuffer(44 + pcm.length * 2), dv = new DataView(buf);
+  const w = (p, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(p + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); dv.setUint32(4, 36 + pcm.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); dv.setUint32(24, outRate, true);
+  dv.setUint32(28, outRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); w(36, 'data'); dv.setUint32(40, pcm.length * 2, true);
+  new Int16Array(buf, 44).set(pcm);
+  return new Uint8Array(buf);
+}
+function b64FromBytes(u8) { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
+
+// ---- the orange button on the bench + its label ----
+const ASSIST_BTN = { id: 'assist', pos: [0.30, 0.0, 0.0], color: [1, 0.55, 0.1, 1], text: 'Ask Nova (AI)', when: () => true, onPress: assistToggle, r: 0.016, press: 0 };
+ASSIST_BTN.L = itemLabel(ASSIST_BTN.text, null, ASSIST_BTN.color);
+GBTN.push(ASSIST_BTN);
+assistShow('Nova · AI lab assistant', 'Poke the orange button and ask a question out loud', [1, 0.6, 0.15, 1]);
+assist.shown = 8;
+
+let assistLastT = 0;
+function assistDraw() {   // called from drawScene while labels are being drawn
+  const now = performance.now(), dt = assistLastT ? Math.min(0.1, (now - assistLastT) / 1000) : 0.016; assistLastT = now;
+  // the button pulses red while listening, amber while thinking
+  ASSIST_BTN.color = assist.state === 'listening' ? [1, 0.15 + 0.15 * Math.sin(performance.now() / 120), 0.15, 1]
+    : assist.state === 'thinking' ? [1, 0.8, 0.2, 1] : [1, 0.55, 0.1, 1];
+  if (assist.state !== 'idle') assist.shown = Math.max(assist.shown, 3);
+  if (assist.shown > 0) {
+    assist.shown -= dt;
+    drawLabel(assist.L, [0.47, 0.17, -0.04], 0.2, Math.min(1, assist.shown));
+  }
+}
+
+// ---- desktop controls: HUD box + hold T to talk ----
+(function assistHud() {
+  const hud = document.getElementById('hud'); if (!hud) return;
+  const box = document.createElement('div');
+  box.innerHTML = `<p style="margin:10px 0 6px"><b>Ask Nova (AI lab assistant)</b>: hold <b>T</b> to talk, or type:</p>
+    <form id="assist-form" style="display:flex;gap:6px"><input id="assist-q" placeholder="e.g. Why did the foam erupt?" style="flex:1;min-width:0;padding:6px 8px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#e6edf3">
+    <button type="submit">Ask</button></form><p id="assist-log" style="white-space:pre-wrap;color:#8b949e;margin:6px 0 0;font-size:12px"></p>`;
+  hud.appendChild(box);
+  document.getElementById('assist-form').addEventListener('submit', e => {
+    e.preventDefault(); const q = document.getElementById('assist-q'); const t = q.value.trim(); if (!t) return;
+    q.value = ''; assistAsk({ text: t });
+  });
+  const enter = document.getElementById('enter');
+  if (enter) enter.addEventListener('click', () => { assistPrime(); }, true);   // ask for the mic before entering MR
+  addEventListener('keydown', e => { if ((e.key === 't' || e.key === 'T') && !e.repeat && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && assist.state !== 'listening') assistStart(); });
+  addEventListener('keyup', e => { if ((e.key === 't' || e.key === 'T') && assist.state === 'listening') assistStop(); });
+})();
 
 </script></body></html>
